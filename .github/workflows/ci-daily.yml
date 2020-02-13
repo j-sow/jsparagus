@@ -1,9 +1,9 @@
 name: CI Daily
 
-on:
-  schedule:
-    # Run daily at 00:00
-    - cron:  '0 0 * * 0-6'
+on: [push]
+  #  schedule:
+  #    # Run daily at 00:00
+  #    - cron:  '0 0 * * 0-6'
 
 jobs:
   build:
@@ -15,9 +15,73 @@ jobs:
       uses: actions/setup-python@v1
       with:
         python-version: "3.7"
+    - name: Checkout jsparagus Repo
+      uses: actions/checkout@v2
+      with:
+        ref: add-test-completion-ci
+    - name: Backup Required Files
+      run: |
+        cp .metrics/fuzzbug_date_badge.py /tmp
+        cp .metrics/tests_compiled_badge.py /tmp
+        cp .metrics/tests_compiled_count.py /tmp
+        cp .metrics/generated_README.md /tmp/README.md
+        cp .metrics/fifo-read.sh /tmp/fifo-read.sh
+        git rev-parse HEAD > /tmp/commit
     - uses: actions/checkout@v2
       with:
+        github_token: ${{ secrets.CI_TOKEN }}
+        fetch-depth: 0
+        persist-credentials: false
         ref: ci_results
+    - name: install mercurial
+      run: |
+        pip install mercurial
+    - name: Checkout Smoosh Repo
+      shell: bash
+      run: |
+        mkdir smoosh
+        hg clone https://hg.mozilla.org/mozilla-central/ smoosh
+    - name: Build Spidermonkey with Smoosh
+      shell: bash
+      run: |
+        export SHELL="/bin/sh"
+        cd smoosh
+        sudo apt-get update
+        ./mach bootstrap --no-interactive --application-choice "Firefox for Desktop Artifact Mode"
+        cd js/src
+        mkdir build_OPT.OBJ && cd build_OPT.OBJ
+        /bin/sh ../configure.in --enable-smoosh
+        make -j 4
+    - name: Run Tests
+      shell: bash
+      run: |
+        cd smoosh
+        export SHELL="/bin/bash"
+        chmod 775 /tmp/fifo-read.sh
+        sh /tmp/fifo-read.sh & ./mach jstests --shell js/src/build_OPT.OBJ/dist/bin/js test262 --args "--smoosh --not-implemented-watchfile /tmp/notimplemented_fifo"
+        echo "q" >> /tmp/notimplemented_fifo
+        cd ..
+        rm -r smoosh
+    - name: Sync metrics files
+      run: |
+        # Make sure the generating files are up to date
+        cp -f /tmp/fuzzbug_date_badge.py .metrics/fuzzbug_date_badge.py
+        cp -f /tmp/tests_compiled_badge.py .metrics/tests_compiled_badge.py
+        cp -f /tmp/tests_compiled_count.py .metrics/tests_compiled_count.py
+        cp -f /tmp/fifo-read.sh .metrics/fifo-read.sh
+        cp -f /tmp/README.md README.md
+        git add .
+    - name: Get Percentage of Tests Compiled
+      run: |
+        cd .metrics/
+        export count_passed=$(tr -cd 1 < /tmp/notimplemented_output | wc -c)
+        export count_tests=$(wc -c < /tmp/notimplemented_output)
+        export current_commit=$(cat /tmp/commit)
+        # Run the files
+        python tests_compiled_count.py
+        git add count/tests_compiled.json
+        python tests_compiled_badge.py
+        git add badges/test-percentage-compiled.json
     - name: Get Fuzzbugs
       run: |
         cd .metrics
@@ -25,22 +89,18 @@ jobs:
         # This action is only used to calculate the days since the last fuzzbug.
         if [ ! -f count/fuzzbug.json ]; then
           curl "https://api.github.com/repos/mozilla-spidermonkey/jsparagus/issues?labels=libFuzzer&state=all" > count/fuzzbug.json
+          git add count/fuzzbug.json
         fi
         python fuzzbug_date_badge.py
         git add badges/since-last-fuzzbug.json
-        git add count/fuzzbug.json
     - name: Commit files
-      # fails if no files to commit
-      continue-on-error: true
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git commit -m "update NotImplemented Count" -a
+        git commit -m "update Fuzzbug and Test Completion Count" -a
     - name: Push changes
-      # fails if no files to commit
-      continue-on-error: true
       uses: ad-m/github-push-action@master
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
+        github_token: ${{ secrets.CI_TOKEN }}
         branch: ci_results
         force: true
